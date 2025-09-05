@@ -212,7 +212,7 @@ LEFT JOIN m3 d USING(liver,month)
 LEFT JOIN m4 e USING(liver,month)
 ORDER BY a.month, a.liver;
 
--- 7. RFM 用户分值（近90 天窗口，可改）
+-- 7. RFM 用户分值（近90 天窗口）
 CREATE OR REPLACE TABLE rfm_user AS
 WITH base AS (
     SELECT uid,
