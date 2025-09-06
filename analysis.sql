@@ -61,8 +61,7 @@ SELECT uid,
        liver,
        ts,
        DATE_TRUNC('month', ts) AS month
--- 从 Parquet 文件导入
-FROM 'fans_events.parquet';
+FROM 'data/fans_events.parquet';
 
 -- 2. 每个主播每月首次关注 = 新增观众
 CREATE OR REPLACE TABLE liver_new AS
@@ -77,8 +76,10 @@ FROM (
 WHERE rn = 1;
 
 -- 3. 观众在关注某主播之前，最常看的主播（排除自己）
+-- 3. 观众在关注某主播之前，最常看的主播（排除自己）+ 带 uid
 CREATE OR REPLACE TABLE new_source AS
-SELECT n.liver  AS target_liver,
+SELECT n.uid,
+       n.liver  AS target_liver,
        n.month,
        COALESCE(
            (SELECT e2.liver
@@ -125,142 +126,119 @@ SELECT source_liver,
 FROM new_target
 GROUP BY ALL;
 
--- 6. AARRRR 漏斗指标（主播×月度）
+-- 1. AARRR 漏斗指标（主播×月度）
 CREATE OR REPLACE TABLE aarr_metrics AS
-WITH m0 AS (
-    /* Acquisition：本月新增关注数 */
-    SELECT liver,
-           month,
-           COUNT(*) AS acq
+WITH
+step_acq AS (
+    SELECT liver, month, COUNT(*) AS acq
     FROM liver_new
-    GROUP BY ALL
+    GROUP BY liver, month
 ),
-m1 AS (
-    /* Activation：新增后 7 日内再次观看的比例 */
-    SELECT n.liver,
-           n.month,
-           COUNT(DISTINCT n.uid) FILTER (
-               WHERE EXISTS (
-                   SELECT 1
-                   FROM events e
-                   WHERE e.uid = n.uid
-                     AND e.liver = n.liver
-                     AND e.ts BETWEEN n.month AND n.month + INTERVAL 7 DAY
-               )
-           ) AS activ,
-           COUNT(DISTINCT n.uid) AS acq2
-    FROM liver_new n
-    GROUP BY ALL
+step_activ AS (
+    SELECT ln.liver, ln.month,
+           COUNT(DISTINCT ln.uid) AS activ,
+           COUNT(*) AS acq_total
+    FROM liver_new ln
+    WHERE EXISTS (
+        SELECT 1
+        FROM events e
+        WHERE e.uid = ln.uid
+          AND e.liver = ln.liver
+          AND e.ts BETWEEN ln.month AND ln.month + INTERVAL 7 DAY
+    )
+    GROUP BY ln.liver, ln.month
 ),
-m2 AS (
-    /* Retention：新增后第 30±3 天仍观看的人数 */
-    SELECT n.liver,
-           n.month,
-           COUNT(DISTINCT n.uid) FILTER (
-               WHERE EXISTS (
-                   SELECT 1
-                   FROM events e
-                   WHERE e.uid = n.uid
-                     AND e.liver = n.liver
-                     AND e.ts BETWEEN n.month + INTERVAL 27 DAY
-                                  AND n.month + INTERVAL 33 DAY
-               )
-           ) AS reten
-    FROM liver_new n
-    GROUP BY ALL
+step_reten AS (
+    SELECT ln.liver, ln.month,
+           COUNT(DISTINCT ln.uid) AS reten
+    FROM liver_new ln
+    WHERE EXISTS (
+        SELECT 1
+        FROM events e
+        WHERE e.uid = ln.uid
+          AND e.liver = ln.liver
+          AND e.ts BETWEEN ln.month + INTERVAL 27 DAY AND ln.month + INTERVAL 33 DAY
+    )
+    GROUP BY ln.liver, ln.month
 ),
-m3 AS (
-    /* Referral：新增用户里带来≥1 个“流入”的人数（source=该主播） */
-    SELECT s.target_liver AS liver,
-           s.month,
-           COUNT(DISTINCT s.uid) AS refer
-    FROM new_source s
-    WHERE s.source_liver = s.target_liver   -- 自引
-    GROUP BY ALL
+step_refer AS (
+    SELECT source_liver AS liver,
+           month,
+           COUNT(DISTINCT uid) AS refer
+    FROM new_source
+    WHERE source_liver <> -1          -- 去掉 YLG 无意义项
+    GROUP BY source_liver, month
 ),
-m4 AS (
-    /* Revenue（这里用“观看次数”代充）：
-       新增用户在随后 30 天内的总观看次数 */
-    SELECT n.liver,
-           n.month,
-           SUM(e.cnt) AS rev
-    FROM liver_new n
+step_rev AS (
+    SELECT ln.liver, ln.month,
+           SUM(e.cnt) AS revenue
+    FROM liver_new ln
     JOIN (
-        SELECT uid,liver,COUNT(*) cnt,MIN(ts) AS fst
+        SELECT uid, liver, COUNT(*) AS cnt
         FROM events
-        GROUP BY ALL
+        WHERE ts BETWEEN ln.month AND ln.month + INTERVAL 30 DAY
+        GROUP BY uid, liver
     ) e
-      ON e.uid = n.uid AND e.liver = n.liver
-    WHERE e.fst BETWEEN n.month AND n.month + INTERVAL 30 DAY
-    GROUP BY ALL
+      ON e.uid = ln.uid AND e.liver = ln.liver
+    GROUP BY ln.liver, ln.month
 )
-SELECT a.liver,
-       a.month,
-       a.acq,
-       COALESCE(b.activ,0) AS activ,
-       ROUND(COALESCE(b.activ,0)*1.0/NULLIF(a.acq,0),3) AS activ_rate,
-       COALESCE(c.reten,0) AS reten,
-       ROUND(COALESCE(c.reten,0)*1.0/NULLIF(a.acq,0),3) AS reten_rate,
-       COALESCE(d.refer,0) AS refer,
-       ROUND(COALESCE(d.refer,0)*1.0/NULLIF(a.acq,0),3) AS refer_rate,
-       COALESCE(e.rev,0) AS revenue
-INTO aarr_metrics
-FROM m0 a
-LEFT JOIN m1 b USING(liver,month)
-LEFT JOIN m2 c USING(liver,month)
-LEFT JOIN m3 d USING(liver,month)
-LEFT JOIN m4 e USING(liver,month)
-ORDER BY a.month, a.liver;
+SELECT
+    a.liver,
+    a.month,
+    a.acq,
+    COALESCE(ac.activ,0) AS activ,
+    COALESCE(r.reten,0)  AS reten,
+    COALESCE(ref.refer,0) AS refer,
+    COALESCE(rv.revenue,0) AS revenue,
+    COALESCE(ac.activ,0)*1.0 / NULLIF(a.acq,0) AS activation_rate,
+    COALESCE(r.reten,0)*1.0 / NULLIF(a.acq,0)  AS retention_rate,
+    COALESCE(ref.refer,0)*1.0 / NULLIF(a.acq,0) AS referral_rate
+FROM step_acq a
+LEFT JOIN step_activ ac USING (liver, month)
+LEFT JOIN step_reten r  USING (liver, month)
+LEFT JOIN step_refer ref USING (liver, month)
+LEFT JOIN step_rev rv USING (liver, month);
 
--- 7. RFM 用户分值（近90 天窗口）
+
+-- 2. RFM 分层（用户×主播）
 CREATE OR REPLACE TABLE rfm_user AS
-WITH base AS (
-    SELECT uid,
-           liver,
-           DATE_DIFF('day', MAX(ts), CURRENT_DATE) AS R,   -- Recency
-           COUNT(*)                                     AS F,   -- Frequency
-           COUNT(*)                                     AS M    -- 无金额→用次数代
+WITH rfm_base AS (
+    SELECT uid, liver,
+           DATE_DIFF('day', MAX(ts), CURRENT_DATE) AS recent_days,
+           COUNT(*) AS behavior_freq,
+           COUNT(*) AS monetary_value
     FROM events
-    WHERE ts >= CURRENT_DATE - INTERVAL 90 DAY
+    WHERE ts >= (SELECT MAX(ts) - INTERVAL 90 DAY FROM events)
     GROUP BY uid, liver
 ),
-qt AS (
+rfm_quantile AS (
     SELECT liver,
-           PERCENTILE_CONT(0.2) WITHIN GROUP (ORDER BY R) AS r_low,
-           PERCENTILE_CONT(0.8) WITHIN GROUP (ORDER BY R) AS r_high,
-           PERCENTILE_CONT(0.2) WITHIN GROUP (ORDER BY F) AS f_low,
-           PERCENTILE_CONT(0.8) WITHIN GROUP (ORDER BY F) AS f_high,
-           PERCENTILE_CONT(0.2) WITHIN GROUP (ORDER BY M) AS m_low,
-           PERCENTILE_CONT(0.8) WITHIN GROUP (ORDER BY M) AS m_high
-    FROM base
+           PERCENTILE_CONT(0.2) WITHIN GROUP (ORDER BY recent_days) AS r_20,
+           PERCENTILE_CONT(0.8) WITHIN GROUP (ORDER BY recent_days) AS r_80,
+           PERCENTILE_CONT(0.2) WITHIN GROUP (ORDER BY behavior_freq) AS f_20,
+           PERCENTILE_CONT(0.8) WITHIN GROUP (ORDER BY behavior_freq) AS f_80
+    FROM rfm_base
     GROUP BY liver
 ),
-score AS (
+rfm_score AS (
     SELECT b.*,
-           qt.r_low, qt.r_high, qt.f_low, qt.f_high, qt.m_low, qt.m_high,
-           CASE WHEN b.R <= qt.r_high THEN 5
-                WHEN b.R <= qt.r_low  THEN 1
-                ELSE 3 END AS r_score,
-           CASE WHEN b.F >= qt.f_high THEN 5
-                WHEN b.F >= qt.f_low  THEN 3
+           CASE WHEN recent_days <= q.r_80 THEN 5
+                WHEN recent_days <= q.r_20 THEN 3
+                ELSE 1 END AS r_score,
+           CASE WHEN behavior_freq >= q.f_80 THEN 5
+                WHEN behavior_freq >= q.f_20 THEN 3
                 ELSE 1 END AS f_score,
-           CASE WHEN b.M >= qt.m_high THEN 5
-                WHEN b.M >= qt.m_low  THEN 3
+           CASE WHEN monetary_value >= q.f_80 THEN 5
+                WHEN monetary_value >= q.f_20 THEN 3
                 ELSE 1 END AS m_score
-    FROM base b
-    JOIN qt USING(liver)
+    FROM rfm_base b
+    JOIN rfm_quantile q USING (liver)
 )
-SELECT uid,
-       liver,
-       R, F, M,
-       r_score, f_score, m_score,
-       CAST(r_score AS VARCHAR) || CAST(f_score AS VARCHAR) || CAST(m_score AS VARCHAR) AS rfm,
-       CASE
-         WHEN r_score>=4 AND f_score>=4 AND m_score>=4 THEN '高价值忠诚'
-         WHEN r_score>=3 AND f_score>=3 THEN '潜力用户'
-         WHEN r_score<=2 THEN '流失风险'
-         ELSE '一般用户'
-       END AS rfm_label
-INTO rfm_user
-FROM score
-ORDER BY liver, r_score DESC, f_score DESC, m_score DESC;
+SELECT *,
+       r_score||f_score||m_score AS rfm_code,
+       CASE WHEN r_score>=4 AND f_score>=4 AND m_score>=4 THEN '高价值忠诚'
+            WHEN r_score>=3 AND f_score>=3 THEN '潜力用户'
+            WHEN r_score<=2 THEN '流失风险'
+            ELSE '一般用户' END AS rfm_user_tag
+FROM rfm_score;
+
