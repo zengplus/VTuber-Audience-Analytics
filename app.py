@@ -7,6 +7,9 @@ from pathlib import Path
 from datetime import datetime, timedelta
 import numpy as np
 from id2name import id2name
+# 放在文件顶部，与其他 import 放一起
+from sklearn.cluster import KMeans
+from sklearn.decomposition import PCA
 
 # ------------------------------ 常量 ---------------------------------
 DB_PATH   = Path(__file__).with_name("mydb.duckdb")
@@ -75,17 +78,34 @@ LANG = {
 language = st.sidebar.selectbox("Language", ["zh", "en"], format_func=lambda x: LANG[x]["lang_switch"])
 T = LANG[language]
 
-
+# 提前把 livers / names 准备好，后面所有模块都能用
+livers = list(id2name.keys())
+names  = [id2name[i] for i in livers]
 
 # ------------------------------ 首页 -------------------------------
 st.set_page_config(layout="wide") # 把页面换到宽体，使页面变更大
 st.title("Virtual Liver Audience Analytics")
 st.markdown("---")
 
-# ------------------------------ 1. 用户流动矩阵 -------------------------------
+
+# ------------------------------ 1. 月度趋势 -------------------------------
+st.header(T["trend"])
+sel_trend = st.multiselect(T["select"], names, default=["嘉然"], key="trend_sel")
+sel_ids_t = [k for k, v in id2name.items() if v in sel_trend]
+if sel_ids_t:
+    conn = get_conn()
+    df_trend = conn.execute(f"""
+        SELECT DATE_TRUNC('month', month) AS month,
+               SUM(CASE WHEN target_liver IN {tuple(sel_ids_t)} THEN 1 ELSE 0 END) AS new_users,
+               SUM(CASE WHEN source_liver IN {tuple(sel_ids_t)} THEN 1 ELSE 0 END) AS lost_users
+        FROM new_source
+        GROUP BY month ORDER BY month
+    """).fetchdf()
+    st.line_chart(df_trend.set_index("month")[["new_users", "lost_users"]])
+
+
+# ------------------------------ 2. 用户流动矩阵 -------------------------------
 st.header(T["matrix"])
-livers = list(id2name.keys())
-names  = [id2name[i] for i in livers]
 sel_names = st.multiselect(T["select"], names, default=["嘉然"], key="matrix_sel")
 sel_ids   = [k for k, v in id2name.items() if v in sel_names]
 if sel_ids:
@@ -125,34 +145,19 @@ if sel_ids:
     src_tbl = src.pivot_table(index="month", columns="主播", values="cnt", fill_value=0).astype(int)
     tgt_tbl = tgt.pivot_table(index="month", columns="主播", values="cnt", fill_value=0).astype(int)
 
-    col1, col2 = st.columns(2)
-    with col1:
-        st.subheader(T["src_table"])
-        st.dataframe(src_tbl.style.background_gradient(cmap="YlGnBu"))
-        st.subheader(T["src_heat"])
-        st.plotly_chart(px.imshow(src_tbl, labels=dict(x="主播", y="月份", color="人数"),
-                                    color_continuous_scale="YlGnBu", aspect="auto"), use_container_width=True)
-    with col2:
-        st.subheader(T["tgt_table"])
-        st.dataframe(tgt_tbl.style.background_gradient(cmap="YlGnBu"))
-        st.subheader(T["tgt_heat"])
-        st.plotly_chart(px.imshow(tgt_tbl, labels=dict(x="主播", y="月份", color="人数"),
-                                    color_continuous_scale="YlGnBu", aspect="auto"), use_container_width=True)
+    # —— 来源部分 ——
+    st.subheader(T["src_table"])
+    st.dataframe(src_tbl.style.background_gradient(cmap="YlGnBu"))
+    st.subheader(T["src_heat"])
+    st.plotly_chart(px.imshow(src_tbl, labels=dict(x="主播", y="月份", color="人数"),
+                                color_continuous_scale="YlGnBu", aspect="auto"), use_container_width=True)
 
-# ------------------------------ 2. 月度趋势 -------------------------------
-st.header(T["trend"])
-sel_trend = st.multiselect(T["select"], names, default=["嘉然"], key="trend_sel")
-sel_ids_t = [k for k, v in id2name.items() if v in sel_trend]
-if sel_ids_t:
-    conn = get_conn()
-    df_trend = conn.execute(f"""
-        SELECT DATE_TRUNC('month', month) AS month,
-               SUM(CASE WHEN target_liver IN {tuple(sel_ids_t)} THEN 1 ELSE 0 END) AS new_users,
-               SUM(CASE WHEN source_liver IN {tuple(sel_ids_t)} THEN 1 ELSE 0 END) AS lost_users
-        FROM new_source
-        GROUP BY month ORDER BY month
-    """).fetchdf()
-    st.line_chart(df_trend.set_index("month")[["new_users", "lost_users"]])
+    # —— 去向部分 ——
+    st.subheader(T["tgt_table"])
+    st.dataframe(tgt_tbl.style.background_gradient(cmap="YlGnBu"))
+    st.subheader(T["tgt_heat"])
+    st.plotly_chart(px.imshow(tgt_tbl, labels=dict(x="主播", y="月份", color="人数"),
+                                color_continuous_scale="YlGnBu", aspect="auto"), use_container_width=True)
 
 # ------------------------------ 3. AARRR 漏斗 -------------------------------
 st.header(T["aarrr"])
@@ -215,59 +220,177 @@ with col2:
 
 # ------------------------------ 5. 聚类 -------------------------------
 st.header(T["cluster"])
-with st.form("cluster_form"):
-    sel_c = st.multiselect(T["select"], names, default=["嘉然"], key="cluster_sel")
-    sel_ids_c = [k for k, v in id2name.items() if v in sel_c]
-    exclude_ylg = st.checkbox("Exclude YLG", value=True)
-    cond_liver = f"AND liver IN {tuple(sel_ids_c)}" if sel_ids_c else ""
-    cond_ylg   = "AND liver != -1" if exclude_ylg else ""
+
+livers = list(id2name.keys())
+names  = [id2name[i] for i in livers]
+
+# 默认参数
+DEFAULT_SEL     = []          # 不限主播
+DEFAULT_MAX_U   = 3000
+DEFAULT_K       = 4
+DEFAULT_EXCLUDE = True
+
+# 真正计算：交给 @st.cache_data 缓存
+@st.cache_data(show_spinner=True)
+def _compute_cluster(_ids: tuple, max_u: int, k: int, exclude: bool):
+    """
+    返回 (plot_df, labels, matrix)
+    数据不足返回 (None,None,None)
+    注意：_ids 用 tuple 才能被哈希
+    """
     conn = get_conn()
-    total_u = conn.execute(f"SELECT COUNT(DISTINCT uid) FROM events WHERE 1=1 {cond_liver} {cond_ylg}").fetchone()[0]
-    max_u = st.slider("Max users", 100, int(total_u), min(3000, int(total_u)), 100)
-    n_clu = st.slider("Clusters", 2, 10, 4)
-    run_c = st.form_submit_button(T["gen"], use_container_width=True)
-if run_c:
-    df_c = conn.execute(f"SELECT uid, liver FROM events WHERE 1=1 {cond_liver} {cond_ylg}").fetchdf()
-    top_u = df_c["uid"].value_counts().head(max_u).index
-    matrix = df_c[df_c["uid"].isin(top_u)].assign(f=1).pivot_table(index="uid", columns="liver", values="f", fill_value=0)
-    from sklearn.cluster import KMeans
-    from sklearn.decomposition import PCA
-    labels = KMeans(n_clusters=n_clu, random_state=42, n_init="auto").fit_predict(matrix)
-    pca = PCA(2).fit_transform(matrix)
+    cond_liver = f"AND liver IN {_ids}" if _ids else ""
+    cond_ylg   = "AND liver != -1" if exclude else ""
+    df = conn.execute(f"""
+        SELECT uid, liver
+        FROM events
+        WHERE 1=1 {cond_liver} {cond_ylg}
+    """).fetchdf()
+
+    if df.empty:
+        return None, None, None
+
+    top_u = df["uid"].value_counts().head(max_u).index
+    df    = df[df["uid"].isin(top_u)]
+    matrix = df.assign(flag=1).pivot_table(index="uid", columns="liver", values="flag", fill_value=0)
+
+    if matrix.shape[0] < 2 or matrix.shape[1] < 2:
+        return None, None, None
+
+    labels = KMeans(n_clusters=k, random_state=42, n_init="auto").fit_predict(matrix)
+    pca    = PCA(2, random_state=42).fit_transform(matrix)
     plot_df = pd.DataFrame(pca, columns=["x", "y"])
     plot_df["cluster"] = labels.astype(str)
-    st.plotly_chart(px.scatter(plot_df, x="x", y="y", color="cluster",
-                               title=f"{len(matrix)} users × {n_clu} clusters"), use_container_width=True)
+    return plot_df, labels, matrix
+
+def _show_cluster(plot_df, labels, matrix):
+    fig = px.scatter(plot_df, x="x", y="y", color="cluster",
+                     title=f"{len(matrix)} users × {len(plot_df['cluster'].unique())} clusters")
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.subheader("Top5 streamers per cluster")
+    for c in sorted(plot_df["cluster"].unique()):
+        idx  = labels == int(c)
+        top5 = matrix[idx].mean().sort_values(ascending=False).head(5)
+        st.write(f"**Cluster {c}**: " + ", ".join([id2name[i] for i in top5.index]))
+
+# 参数面板
+with st.form("cluster_form"):
+    sel_names = st.multiselect(T["select"], names, default=DEFAULT_SEL, key="c1")
+    sel_ids   = tuple([k for k, v in id2name.items() if v in sel_names])  # 转 tuple 以便哈希
+
+    total_u = get_conn().execute("SELECT COUNT(DISTINCT uid) FROM events").fetchone()[0]
+    max_u   = st.slider("Max users", 100, int(total_u), min(DEFAULT_MAX_U, int(total_u)), 100)
+    k       = st.slider("Cluster count", 2, 10, DEFAULT_K)
+    exclude = st.checkbox("Exclude YLG", value=DEFAULT_EXCLUDE)
+    run     = st.form_submit_button(T["gen"], use_container_width=True)
+
+# 清缓存按钮（可选）
+if st.button("🗑 清聚类缓存"):
+    _compute_cluster.clear()   # 手动失效
+    st.success("缓存已清空，请重新生成！")
+
+# 首次自动跑
+if "cluster_auto" not in st.session_state:
+    plot_df, labels, matrix = _compute_cluster(tuple(DEFAULT_SEL), DEFAULT_MAX_U, DEFAULT_K, DEFAULT_EXCLUDE)
+    if plot_df is not None:
+        _show_cluster(plot_df, labels, matrix)
+    st.session_state.cluster_auto = True
+
+# 手动提交
+if run:
+    plot_df, labels, matrix = _compute_cluster(sel_ids, max_u, k, exclude)
+    if plot_df is None:
+        st.warning("数据过少或无数据")
+    else:
+        _show_cluster(plot_df, labels, matrix)
+
 
 # ------------------------------ 6. 兴趣关联 -------------------------------
 st.header(T["assoc"])
-with st.form("assoc_form"):
-    sel_a = st.multiselect(T["select"], names, default=["YLG"], key="assoc_sel")
-    sel_ids_a = [k for k, v in id2name.items() if v in sel_a]
-    exclude_ylg_a = st.checkbox("Exclude YLG in result", value=False)
-    top_n = st.slider("Top N", 3, 15, 8)
-    run_a = st.form_submit_button(T["gen"], use_container_width=True)
-if run_a and sel_ids_a:
+
+livers = list(id2name.keys())
+names  = [id2name[i] for i in livers]
+
+# 默认参数
+DEFAULT_TARGETS = ["嘉然"]
+DEFAULT_TOP_N   = 8
+DEFAULT_EXCLUDE = False
+
+# 真正计算：@st.cache_data 托管
+@st.cache_data(show_spinner=True)
+def _compute_assoc(target_ids: tuple, top_n: int, exclude: bool):
+    """
+    返回 top_df（含主播名列），不足返回 None
+    """
     conn = get_conn()
-    src = conn.execute(f"""
-        SELECT source_liver AS liver, SUM(cnt) AS c
-        FROM monthly_matrix WHERE target_liver IN {tuple(sel_ids_a)}
-        GROUP BY liver
+    src_df = conn.execute(f"""
+        SELECT source_liver AS liver, SUM(cnt) AS cnt
+        FROM monthly_matrix
+        WHERE target_liver IN {target_ids}
+        GROUP BY source_liver
     """).fetchdf()
-    tgt = conn.execute(f"""
-        SELECT target_liver AS liver, SUM(cnt) AS c
-        FROM monthly_matrix_out WHERE source_liver IN {tuple(sel_ids_a)}
-        GROUP BY liver
+
+    tgt_df = conn.execute(f"""
+        SELECT target_liver AS liver, SUM(cnt) AS cnt
+        FROM monthly_matrix_out
+        WHERE source_liver IN {target_ids}
+        GROUP BY target_liver
     """).fetchdf()
-    top = pd.concat([src, tgt]).groupby("liver", as_index=False)["c"].sum()
-    top = top[~top["liver"].isin(sel_ids_a)]
-    if exclude_ylg_a:
-        top = top[top["liver"] != -1]
-    top = top.sort_values("c", ascending=False).head(top_n)
+
+    total_df = pd.concat([src_df, tgt_df]).groupby("liver", as_index=False)["cnt"].sum()
+    total_df = total_df[~total_df["liver"].isin(target_ids)]
+    if exclude:
+        total_df = total_df[total_df["liver"] != -1]
+
+    if total_df.empty:
+        return None
+
+    top = total_df.sort_values("cnt", ascending=False).head(top_n)
+    rest_cnt = total_df.iloc[top_n:]["cnt"].sum()
+    if rest_cnt > 0:
+        top = pd.concat([top, pd.DataFrame({"liver": [-999], "cnt": [rest_cnt]})])
+        id2name[-999] = "Others"
     top["主播名"] = top["liver"].map(id2name)
-    fig_p = px.pie(top, names="主播名", values="c",
-                   title=f"Fans of {'/'.join([id2name[i] for i in sel_ids_a])} also like")
-    st.plotly_chart(fig_p, use_container_width=True)
+    return top
+
+def _show_assoc(top_df):
+    fig = px.pie(top_df, names="主播名", values="cnt",
+                 title=f"Users who like {'/'.join(top_df.loc[top_df['liver']!=-999, '主播名'])} also like",
+                 color_discrete_sequence=px.colors.sequential.YlGnBu_r)
+    fig.update_traces(textposition="inside", textinfo="percent+label")
+    st.plotly_chart(fig, use_container_width=True)
+
+# 参数面板
+with st.form("assoc_form"):
+    target_names = st.multiselect("Target streamers", names,
+                                  default=DEFAULT_TARGETS, key="a1")
+    target_ids = tuple([k for k, v in id2name.items() if v in target_names])  # 转 tuple 供哈希
+
+    exclude = st.checkbox("Exclude YLG (-1)", value=DEFAULT_EXCLUDE)
+    top_n   = st.slider("Top N in pie", 3, 15, DEFAULT_TOP_N)
+    run     = st.form_submit_button(T["gen"], use_container_width=True)
+
+# 清缓存按钮（可选）
+if st.button("🗑 清兴趣关联缓存"):
+    _compute_assoc.clear()
+    st.success("缓存已清空，请重新生成！")
+
+# 首次自动跑
+if "assoc_auto" not in st.session_state:
+    top_df = _compute_assoc(tuple([k for k, v in id2name.items() if v in DEFAULT_TARGETS]),
+                            DEFAULT_TOP_N, DEFAULT_EXCLUDE)
+    if top_df is not None:
+        _show_assoc(top_df)
+    st.session_state.assoc_auto = True
+
+# 手动提交
+if run:
+    top_df = _compute_assoc(target_ids, top_n, exclude)
+    if top_df is None:
+        st.warning("No data")
+    else:
+        _show_assoc(top_df)
 
 # ------------------------------ 7. 增量更新 -------------------------------
 st.header(T["update"])
