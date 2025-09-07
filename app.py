@@ -25,7 +25,7 @@ LANG = {
     "zh": {
         "lang_switch": "语言 / Language",
         "matrix": "用户流动矩阵分析",
-        "trend": "月度用户流动趋势",
+        "trend": "用户流动趋势分析",
         "aarrr": "AARRR 漏斗分析",
         "rfm": "RFM 用户分层",
         "cluster": "用户群体聚类分析",
@@ -50,7 +50,7 @@ LANG = {
     "en": {
         "lang_switch": "Language / 语言",
         "matrix": "User Transfer Matrix",
-        "trend": "Monthly User Flow Trend",
+        "trend": "User Flow Trend Analysis",
         "aarrr": "AARRR Funnel",
         "rfm": "RFM Segmentation",
         "cluster": "User Clustering",
@@ -84,7 +84,7 @@ names  = [id2name[i] for i in livers]
 
 # ------------------------------ 首页 -------------------------------
 st.set_page_config(layout="wide") # 把页面换到宽体，使页面变更大
-st.title("Virtual Liver Audience Analytics")
+st.title("VTuber Flow and Audience Analytics System")
 st.markdown("---")
 
 
