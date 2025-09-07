@@ -1,5 +1,5 @@
 
-# VTuber-Flow-Analytics
+# VTuber-Flow-Analysis
 
 [![Python](https://img.shields.io/badge/Python-3.8+-blue.svg)](https://www.python.org/)
 [![Streamlit](https://img.shields.io/badge/Streamlit-1.28+-green.svg)](https://streamlit.io/)
@@ -8,10 +8,10 @@
 
 [English](README_EN.md) | 中文
 
-> [!NOTE]  
+> [!NOTE]
 > **基于 [哔哩哔哩【V圈大数据】](https://b23.tv/cQoNsjj)数据参考，仅供学习与交流。**
 
-> [!IMPORTANT]  
+> [!IMPORTANT]
 > **本项目仅作为数据分析的学习实践结果，所有数据均为网络公开数据脱敏后示例，不含任何个人隐私，亦不构成商业建议。**
 
 ---
