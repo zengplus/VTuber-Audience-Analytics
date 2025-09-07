@@ -93,8 +93,8 @@ streamlit run app.py
 
 ### 界面预览
 
-#### 结果页示例
-![Home Page](images/home_page.png)
+#### Demo演示
+![Demo](images/demo.gif)
 
 ## 项目结构
 
